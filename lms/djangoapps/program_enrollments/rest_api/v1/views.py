@@ -11,7 +11,6 @@ from django.db import transaction
 from edx_rest_framework_extensions import permissions
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication
 from edx_rest_framework_extensions.auth.session.authentication import SessionAuthenticationAllowInactiveUser
-from opaque_keys.edx.keys import CourseKey
 from organizations.models import Organization
 from rest_framework import status
 from rest_framework.generics import RetrieveAPIView
@@ -36,7 +35,6 @@ from lms.djangoapps.program_enrollments.constants import (
 )
 from lms.djangoapps.program_enrollments.exceptions import ProviderDoesNotExistException
 from openedx.core.djangoapps.catalog.utils import (
-    course_run_keys_for_program,
     get_programs,
     get_programs_by_type,
     get_programs_for_organization,
@@ -63,7 +61,8 @@ from .utils import (
     ProgramSpecificViewMixin,
     UserProgramSpecificViewMixin,
     get_enrollment_http_code,
-    get_program_course_run_overviews,
+    get_enrollment_overviews,
+    get_enrollments_for_courses_in_program,
     verify_course_exists_and_in_program,
     verify_program_exists,
     verify_user_enrolled_in_program
@@ -895,17 +894,16 @@ class ProgramCourseEnrollmentOverviewView(
         Defines the GET endpoint for overviews of course enrollments
         for a user as part of a program.
         """
-        course_run_keys = [
-            CourseKey.from_string(key)
-            for key in course_run_keys_for_program(self.program)
-        ]
-        course_run_overviews = get_program_course_run_overviews(
+        enrollments = get_enrollments_for_courses_in_program(
+            self.request.user, self.program
+        )
+        enrollment_overviews = get_enrollment_overviews(
             user=self.request.user,
             program=self.program,
-            course_keys=course_run_keys,
+            enrollments=enrollments,
             request=self.request,
         )
-        return {'course_runs': course_run_overviews}
+        return {'course_runs': enrollment_overviews}
 
 
 class EnrollmentDataResetView(APIView):
