@@ -7,14 +7,24 @@ ProgramEnrollment V1 API internal utilities.
 from datetime import datetime, timedelta
 from functools import wraps
 
+from django.core.exceptions import PermissionDenied
 from django.utils.functional import cached_property
 from opaque_keys.edx.keys import CourseKey
 from pytz import UTC
 from rest_framework import status
 
+from course_modes.models import CourseMode
+from lms.djangoapps.bulk_email.api import get_emails_enabled
+from lms.djangoapps.certificates.api import get_certificates_for_user_by_course_keys
+from lms.djangoapps.course_api.api import get_course_run_url, get_due_dates
 from lms.djangoapps.grades.rest_api.v1.utils import CourseEnrollmentPagination
+from lms.djangoapps.program_enrollments.api import fetch_program_enrollments
+from lms.djangoapps.program_enrollments.constants import ProgramEnrollmentStatuses
 from openedx.core.djangoapps.catalog.utils import get_programs, is_course_run_in_program
+from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
 from openedx.core.lib.api.view_utils import verify_course_exists
+from student.helpers import get_resume_urls_for_enrollments
+from student.models import CourseEnrollment
 
 from .constants import CourseRunProgressStatuses
 
@@ -37,6 +47,8 @@ class ProgramSpecificViewMixin(object):
     def program(self):
         """
         The program specified by the `program_uuid` URL parameter.
+
+        Returns: dict
         """
         return get_programs(uuid=self.program_uuid)
 
@@ -44,8 +56,33 @@ class ProgramSpecificViewMixin(object):
     def program_uuid(self):
         """
         The program specified by the `program_uuid` URL parameter.
+
+        Returns: str
         """
         return self.kwargs['program_uuid']
+
+
+class UserProgramSpecificViewMixin(ProgramSpecificViewMixin):
+    """
+    A mixin for views that operate on a specific program in the context of a user.
+
+    Requires `program_uuid` to be one of the kwargs to the view.
+
+    The property `target_user` returns the user that that we should operate with.
+    """
+    @property
+    def target_user(self):
+        """
+        The user that this view's operations should operate in the context of.
+
+        By default, this is the requesting user.
+
+        This can be overriden in order to implement "user-parameterized" views,
+        which, for example, a global staff member could use to see API responses
+        in the context of a specific learner. This could be used to help implement
+        masquerading.
+        """
+        return self.request.user
 
 
 class ProgramCourseSpecificViewMixin(ProgramSpecificViewMixin):
@@ -72,7 +109,7 @@ def verify_program_exists(view_func):
     Expects to be used within a ProgramSpecificViewMixin subclass.
     """
     @wraps(view_func)
-    def wrapped_function(self, request, **kwargs):
+    def wrapped_function(self, *args, **kwargs):
         """
         Wraps the given view_function.
         """
@@ -82,7 +119,7 @@ def verify_program_exists(view_func):
                 developer_message='no program exists with given key',
                 error_code='program_does_not_exist'
             )
-        return view_func(self, request, **kwargs)
+        return view_func(self, *args, **kwargs)
     return wrapped_function
 
 
@@ -101,7 +138,7 @@ def verify_course_exists_and_in_program(view_func):
     @wraps(view_func)
     @verify_program_exists
     @verify_course_exists
-    def wrapped_function(self, request, **kwargs):
+    def wrapped_function(self, *args, **kwargs):
         """
         Wraps view function
         """
@@ -111,8 +148,112 @@ def verify_course_exists_and_in_program(view_func):
                 developer_message="the program's curriculum does not contain the given course",
                 error_code='course_not_in_program'
             )
-        return view_func(self, request, **kwargs)
+        return view_func(self, *args, **kwargs)
     return wrapped_function
+
+
+def verify_user_enrolled_in_program(view_func):
+    """
+    Raised PermissionDenied if the `target_user` is not enrolled in the program.
+
+    Expects to be used within a UserProgramViewMixin subclass.
+    """
+    @wraps(view_func)
+    def wrapped_function(self, *args, **kwargs):
+        """
+        Wraps the given view_function.
+        """
+        user_enrollment_qs = fetch_program_enrollments(
+            program_uuid=self.program_uuid,
+            users={self.target_user},
+            program_enrollment_statuses={ProgramEnrollmentStatuses.ENROLLED},
+        )
+        if not user_enrollment_qs.exists():
+            raise PermissionDenied
+        return view_func(self, *args, **kwargs)
+    return wrapped_function
+
+
+def get_program_course_run_overviews(user, program, course_keys, request):
+    """
+    TODO
+
+    Arguments:
+        user (User)
+        program (Program)
+        course_keys (iterable[CourseKey])
+        request (HttpRequest)
+
+    Returns list[dict]
+    """
+    enrollments = CourseEnrollment.objects.filter(
+        user=user,
+        course_id__in=course_keys,
+        mode__in=[CourseMode.VERIFIED, CourseMode.MASTERS],
+        is_active=True,
+    )
+    overviews_by_course_key = CourseOverview.get_from_ids(course_keys)
+    certficates_by_course_key = get_certificates_for_user_by_course_keys(user, course_keys)
+    resume_urls_by_course_key = get_resume_urls_for_enrollments(user, enrollments)
+    return [
+        get_program_course_run_overview(
+            user=user,
+            program=program,
+            course_key=enrollment.course_id,
+            course_overview=overviews_by_course_key[enrollment.course_id],
+            certificate_info=certficates_by_course_key.get(enrollment.course_id, {}),
+            relative_resume_url=resume_urls_by_course_key.get(enrollment.course_id),
+            request=request,
+        )
+        for enrollment in enrollments
+    ]
+
+
+def get_program_course_run_overview(
+        user,
+        program,
+        course_key,
+        course_overview,
+        certificate_info,
+        relative_resume_url,
+        request,
+):
+    """
+    TODO
+
+    Arguments:
+        user (User)
+        program (Program)
+        course_key (CourseKey)
+        course_overview (CourseOverview)
+        certificate_info (dict)
+        relative_resume_url (str)
+        request (HttpRequest)
+
+    Returns: dict
+    """
+    result = {
+        'course_run_id': course_key,
+        'display_name': course_overview.display_name_with_default,
+        'course_run_status': get_course_run_status(course_overview, certificate_info),
+        'course_run_url': get_course_run_url(request, course_key),
+        'start_date': course_overview.start,
+        'end_date': course_overview.end,
+        'due_dates': get_due_dates(request, course_key, user),
+    }
+    emails_enabled = get_emails_enabled(user, course_key)
+    if emails_enabled is not None:
+        result['emails_enabled'] = emails_enabled
+    download_url = certificate_info.get('download_url')
+    if download_url:
+        result['certificate_download_url'] = request.build_absolute_uri(
+            certificate_info['download_url']
+        )
+    if program['type'] == 'MicroMasters':
+        result['micromasters_title'] = program['title']
+    if relative_resume_url:
+        result['resume_course_run_url'] = request.build_absolute_uri(relative_resume_url)
+    return result
 
 
 def get_enrollment_http_code(result_statuses, ok_statuses):
